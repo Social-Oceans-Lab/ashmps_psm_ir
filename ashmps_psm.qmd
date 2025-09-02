@@ -1,0 +1,843 @@
+---
+title: "Analysis: Propensity Score Matching & Interval Regression"
+subtitle: "Off the boat and into the bank: Direct market channels and seafood sales"
+format:
+  html:
+    theme: lumo
+    toc: true
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+
+execute:
+  echo: true
+  cache: true
+---
+
+```{r setup}
+#| label: load libraries
+#| echo: false
+#| message: false
+#| warning: false
+#| cache: false
+
+library(here)
+library(tidyr)
+library(dplyr)
+library(purrr)
+library(forcats)
+library(stringr)
+library(broom)
+library(janitor)
+library(scales)
+library(ggplot2)
+library(patchwork)
+#library(ggeffects)
+#library(AICcmodavg)
+library(knitr)
+library(tidycensus)
+library(MatchIt)
+library(cobalt)
+library(ComplexUpset)
+library(survival)
+library(gtsummary)
+library(gt)
+#library(ggridges)
+
+ashmps_data <- read.csv("https://osf.io/b2jpf/download", header = TRUE, na.strings = c("","NA"))
+
+```
+
+# Introduction
+
+This analysis asks which direct marketing strategies, such as selling solely Direct To Consumer (DTC) channels versus multi-channel portfolios that include direct sales to retailers, foodservices, institutions, or source-identified distributors, maximize seafood sales income for U.S. DSM? We address this gap using data from the 2023 American Seafood Harvesters Marketing Practices Survey (ASHMPS), the first nationally representative dataset of U.S. direct marketing fishers (Advani et al., 2024). We draw upon a causal inference framework, using propensity score matching and interval regression, to estimate the effects of various marketing strategies on revenue from direct seafood sales, while controlling for regional contexts.
+
+## Overview
+
+Before diving into our methodological approach which uses a smaller, experimentally-comparable sample size, let's get a sense of how direct marketing strategies have been engaged with in our larger survey sample.
+
+```{r ashmps-overview}
+#| include: true
+#| echo: true
+#| warning: false 
+#| column: screen
+#| out-width: "100%"
+#| fig-cap:
+#|  - "Figure 1: Findings from the ASHMPS (N=595) indicating (A) percent engagement with (and total N for) each marketing channel, and (B) the history of adoption of various marketing channels. (percentages are more than a 100% because multiple channels could have been engaged with, engagement history has been loess smoothed)."
+
+mkt_channels <- ashmps_data %>% 
+  select(ExternalReference, Q0.2a:Q0.2e) %>% 
+  rename(Consumer = 'Q0.2a',
+         Retail = 'Q0.2b',
+         Foodservices = 'Q0.2c',
+         Institution = 'Q0.2d',
+         SID = 'Q0.2e') %>% 
+  pivot_longer(Consumer:SID, names_to = "channel") %>% 
+  filter(value == "Yes") %>% 
+  group_by(channel) %>% 
+  summarise(count = n_distinct(ExternalReference[channel == channel]),
+            .groups = "drop") %>% 
+  mutate(total = n_distinct(ashmps_data$ExternalReference),
+         pct = count / total,
+         pct_label = percent(pct, accuracy = 0.1))
+
+f1_a <- ggplot(mkt_channels, aes(x = reorder(channel, -pct), y = pct, fill = channel)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = pct_label), vjust = -2.5, size = 4) +
+  geom_text(aes(label = count), vjust = -1, size = 3.5) +
+  #scale_fill_viridis(discrete = TRUE, direction = -1) +
+  scale_fill_manual(breaks = c("Consumer", "Retail", "Foodservices", "Institution", "SID"),
+                    values = c("#C15227", "#062539", "#436AB3", "#99B0DB", "#FDEB4D")) +
+  scale_y_continuous(limits = c(0, 1), labels = percent_format(), expand = c(0, 0)) +
+  labs(x = NULL, y = NULL) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    axis.text = element_text(size = 8)
+  )
+
+
+# Marketing Experience History
+mkt_exp <- ashmps_data %>% 
+  select(ExternalReference, Q1.2_1, Q2.2_1, Q3.2_1, Q4.2_1, Q5.3_1) %>% 
+  rename("Consumer" = Q1.2_1,
+         "Retail" = Q2.2_1,
+         "Foodservices" = Q3.2_1,
+         "Institution" = Q4.2_1,
+         "SID" = Q5.3_1) %>% 
+  mutate(earliest_dsm = pmin(Consumer, Retail, Foodservices, Institution, SID, na.rm = TRUE),
+         mkt_exp = 2023 - earliest_dsm)
+
+xp_long <- mkt_exp %>%
+  pivot_longer(cols = c(Consumer:SID), names_to = "channel", values_to = "start_year") %>%
+  filter(!is.na(start_year)) %>%
+  mutate(experience = 2023 - start_year)
+
+adoption <- xp_long %>% count(channel, start_year)
+
+labels_df <- tibble(channel = c("SID", "Consumer", "Retail", "Foodservices", "Institution"),
+                    start_year = 2023,
+                    y_pos = c(8.25, 18.75, 9.25, 6.75, 4.25))
+ 
+f1_b <- ggplot(adoption, aes(x = start_year, y = n, color = channel)) +
+   geom_smooth(method = "loess", se = FALSE, size = 1.2, span= 0.5, alpha = 0.7) +
+   scale_color_manual(breaks = c("SID", "Consumer", "Retail", "Foodservices", "Institution"),
+                   values = c("#FDEB4D", "#C15227", "#062539", "#436AB3", "#99B0DB")) +
+  geom_text(data = labels_df,
+            aes(x = start_year, y = y_pos, label = channel, color = channel),
+            hjust = 0, size = 3) +
+  scale_x_continuous(expand = expansion(mult = c(0.01, 0.3))) +
+   labs(#subtitle = "Adoption of Direct Marketing Channels Over Time",
+        x = "Year Started",
+        y = "Number of New Adopters",
+        color = "Channel") +
+   theme_classic() +
+  theme(legend.position = "none")
+ 
+
+fig_1 <- f1_a + f1_b + plot_annotation(tag_levels = 'A')
+
+fig_1
+
+ggsave(plot = fig_1, here("plots", "Fig1.tif"), width = 183, height = 80, units = "mm", bg = "white")
+
+table_2 <- ashmps_data %>%
+  select(ExternalReference, Q0.2a:Q0.2e) %>% 
+  rename(Consumer = 'Q0.2a',
+         Retail = 'Q0.2b',
+         Foodservices = 'Q0.2c',
+         Institution = 'Q0.2d',
+         SID = 'Q0.2e') %>% 
+  mutate(Consumer = Consumer == "Yes",
+    RetailFood = (Retail == "Yes" | Foodservices == "Yes"),
+    SIDInst = (SID == "Yes" | Institution == "Yes")) %>%
+  summarise(Consumer = sum(Consumer, na.rm = TRUE),
+    RetailFood = sum(RetailFood, na.rm = TRUE),
+    SIDInst = sum(SIDInst, na.rm = TRUE),
+    total = n()) %>%
+  tidyr::pivot_longer(-total, names_to = "channel", values_to = "count") %>%
+  mutate(pct = count / total,
+    pct_label = percent(pct, accuracy = 0.1))
+
+table_2_subset <- ashmps_data %>%
+  select(ExternalReference, Q0.2a, Q1.1a:Q1.1f) %>% 
+  filter(Q0.2a == "Yes") %>% 
+  rename(OffBoat = 'Q1.1a',
+         HomeDelivery = 'Q1.1c',
+         Roadside = 'Q1.1b',
+         FarmersMarket = 'Q1.1d',
+         CSF = 'Q1.1e',
+         OtherDSM = 'Q1.1f') %>% 
+  pivot_longer(OffBoat:OtherDSM, names_to = "channel") %>% 
+  filter(value == "Yes") %>% 
+  group_by(channel) %>% 
+  summarise(count = n_distinct(ExternalReference), .groups = "drop") %>% 
+  mutate(total = n_distinct(ashmps_data$ExternalReference[ashmps_data$Q0.2a == "Yes"]),
+         pct = count / total,
+         pct_label = percent(pct, accuracy = 0.1))
+  
+  
+table_2
+table_2_subset
+```
+
+# Methods
+
+## Data Source and Variable Description
+
+We use data from the ASHMPS, which had a total of 595 valid responses. However, our sample for analysis is restricted to 323 respondents who reported complete data on marketing strategies, direct sales revenue, and other covariates of interest. The primary research question is whether and how engagement with direct marketing channels -- particularly combinations that include or exclude DTC sales -- affects revenue levels.
+
+### Dependent Variable
+
+Our dependent variable is thus reported income from direct seafood sales, which is reported in ordered income ranges (e.g. \$1 - \$999, \$1,000 - \$9,999, etc.) Due to low or no reported direct seafood sales income above \$250,000 in certain regions of the US, the last income bracket is collapsed to "\$250,000 and over". This is comparable with USDA classifications of farms selling locally and directly. Low and Vogel (2011) classify small farms as those with less than '\$50,000' in gross annual sales, medium-sized farms as those with sales between \$50,000 and \$250,000, and large farms with gross annual sales exceeding \$250,000. While surveys like the LFMPS ask for actual dollar amounts of agricultural direct sales value, the ASHMPS is limited to asking only for income ranges of direct seafood sales. For this reason, we conduct interval regressions rather than regressions using reported dollar values of direct sales.
+
+### Independent Variables
+
+We created two independent variables to model marketing strategy. The first, DTC, is a binary variable indicating whether the business engages (1) or does not (0) engage in direct sales to consumers. The second independent variable, Marketing Strategy, is a categorical variable capturing the different combinations of market channel engagement (e.g. DTC only, DTC and Direct to Retail, SID only, etc.). Rare combinations were grouped into an "Other" category based on frequency and distribution of strategies across regions.
+
+### Additional Covariates
+
+We determine a list of variables that may influence whether operations choose a particular marketing channel or not. We want to capture as many factors as we can, while trying to achieve balance between control and treatment groups. This way we can make the case that there are few unobserved factors which may influence which market strategies get adopted. To avoid multicollinearity, variables that represented similar aspects of business or the marketing environment and were highly correlated with other covariates were not included. These include volumes of seafood landed, the value (USD\$) of seafood sales, number of operations selling directly to retail, the value of direct agricultural sales to wholesale, etc.
+
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Covariates for Matching         | Description                                                                                                                                                                                            | Inclusion Rational                                                                                                                                                                                                                                                                                                                                 |
++=================================+========================================================================================================================================================================================================+====================================================================================================================================================================================================================================================================================================================================================+
+| Sex                             | Business owner's reported sex. Binary (1=Male, 0=Female).                                                                                                                                              | Female-led farms are significantly more likely to participate in DTC (Plakias *et al.* 2020).                                                                                                                                                                                                                                                      |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Race                            | Respondent reported race, with factors collapsed to align with OMB categories, including Multiracial for two or more reported Races                                                                    | Race influences participation in DTC channels. African-American led farms may have lower sales than other farms, but also experience sales advantages thanks to their network (Park et al. 2024b)                                                                                                                                                  |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Major Occupation                | Whether fishing or seafood sales is a primary (1) or secondary occupation (0)                                                                                                                          | Primary-occupation DSMs may seek additional channels beyond DTC to sustain livelihoods, whereas part-time DSMs may prefer the flexibility of DTC sales. Farmers primarily engaged in farming were significantly more likely to sell direct to retail, possibly due to the ability to forge connections with retailers (Plakias et al. 2020)        |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Marketing Experience            | Longest number of years that an operation has engaged with any direct marketing channels.                                                                                                              | Fewer years of direct marketing experience is significantly associated with participation in DTC (Plakias et al. 2020). Greater marketing experience is linked to higher sales, more so than equivalent farming experience (Park et al. 2024a)                                                                                                     |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Family Owned                    | Binary Variable indicating whether business is family owned (1) or not (0).                                                                                                                            | Family-owned farms predominate DTC markets at smaller scales, but as operations grow and diversify into additional channels, they increasingly require hired labor and formal organization (Bauman et al. 2018)                                                                                                                                    |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Seafood Type                    | Binary variables for selling Live, Fresh, Frozen, Finfish, Crustaceans, and Mollusks. Other infrequently used seafood products (e.g. seaweed or smoked seafood) were excluded to preserve sample size. | Product type strongly shapes market feasibility. Farms selling animal products are significantly more likely to sell DTC (Bauman et al. 2018; Plakias et al. 2020). Highly perishable fresh or live seafood require intensive consumer-facing marketing, while frozen seafood may enable participation across multiple channels.                   |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Number Paid Employees           | Continuous variable indicative of business size and indirectly linked to income. Natural log transformed to account for variance in counts.                                                            | Labor investments increase as operations grow in scale and adopt additional marketing channels (Bauman et al 2018)                                                                                                                                                                                                                                 |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| NOAA Region                     | Categorical variable that grouped states in the US based on the NOAA regional office they were a part of.                                                                                              | Differences in fisheries, seafood markets, infrastructure, and consumer preferences across NOAA regions shape the likelihood of DSMs adopting DTC. Farms in the Northeast and West more likely to engage in DTC due to denser population centers and established local food movements (Bauman et al. 2018; Park et al. 2024a; Plakias et al. 2020) |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Median Income                   | Continuous variable indicative of affluence of county where business is based (American Community Survey 2022).                                                                                        | Higher local median income increases consumer willingness to pay premiums for local foods, which is positively associated with DTC participation (Bauman et al. 2018; Timmons and Wang 2010)                                                                                                                                                       |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| RUCC                            | Rural Urban Continuum Code at the county level for 2023. Indicative of how urbanized an operation's location may be (ERS 2024)                                                                         | Urban proximity is a key determinant of DTC participation. Direct sales farms located in metro counties significantly outperformed those in areas farther from population centers due to access to larger consumer bases (Bauman et al. 2018).                                                                                                     |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Seafood Jobs                    | Number of seafood industry jobs in each state in 2022 (FEUS 2024). Natural log transformed to account for variance in counts.                                                                          | A larger seafood workforce reflects greater sector infrastructure (processors, distributors, buyers) that can both enable and substitute DTC sales.                                                                                                                                                                                                |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Landings Value (\$)             | Total ex-vessel value (USD\$) of seafood landings in each state in 2022 (FOSS 2024). Natural log transformed to account for variance in economic values.                                               | State-level landings reflect the vitality of fisheries economies. Strong ex-vessel markets may reduce reliance on DTC, while weaker fisheries may push DSMs towards direct marketing to capture premiums or avoid wholesale price fluctuations.                                                                                                    |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Direct Retail Value (\$)        | USDA county data on the value (USD\$) of agricultural products directly marketed to retail (USDA 2022). Natural log transformed to account for variance in economic values. \|                         | Higher local direct retail value increases the probability that DSMs will consider DTC participation (Bauman et al. 2018; Park et al. 2024a; Plakias et al. 2020)                                                                                                                                                                                  |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Direct Wholesale Operations (N) | USDA county data on the number of farms with direct sales to wholesale channels (USDA 2022). Natural log transformed to account for variance in counts.                                                | A large number of farms engaged in direct wholesale sales suggests strong intermediated local supply chains (Bauman et al. 2018; Park et al. 2024a; Plakias et al. 2020). In such settings, DSMs may be less reliant on DTC and more likely to sell into local intermediated supply chains.                                                        |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| Foodservice Value (\$)          | USDA county data on the value (USD\$) of Food, Service and Accommodation data for 2023. Natural log transformed to account for variance in economic values.                                            | Indicative of size of food service sector -- DSMs may be less likely to undertake DTC sales if there is a strong local food service sector(Bauman et al. 2018; Park et al. 2024a; Plakias et al. 2020)                                                                                                                                             |
++---------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+
+```{r external-data}
+#| echo: false
+#| message: false
+#| warning: false
+#| cache: false
+
+# Incorporating additional data from external sources
+#census_api_key("8988f6e0f6d52eec532b9c4d4b87c9aba1871b50", install = TRUE)
+
+# Finalized external data has been provided in the repo. Files used below in this code chunk are confidential. 
+
+# Non-anonymized response data for zip code. Contact authors for access. 
+svy_dat <- read.csv("~/GitHub/direct-seafood-survey/output_files/valid_svy_resp_data.csv", header = TRUE, na.strings = c("","NA"))
+
+# Fisheries data
+fishy_data_raw <- read.csv(here("input_files","feus_2022_data.csv"), header = TRUE, na.strings = c("","NA"))
+
+fishy_data <- fishy_data_raw %>% 
+  mutate(across(
+    c(landing_pounds, landing_tons, landing_dollars, seafood_jobs, seafood_sales, seafood_income),
+    ~ log(.x + 1)))
+
+
+# Rural-Urban Continuum Codes (Source: ERS)
+rucc2023 <- read.csv(here("input_files","Ruralurbancontinuumcodes2023.csv"), header = TRUE, na.strings = c("","NA"))
+
+# Local Food Data (Source: Jeff O'Hara)
+local_food_raw <- read.csv(here("input_files","county_level_local_food_data.csv"), header = TRUE, na.strings = c("","NA"))
+
+
+local_food <- local_food_raw %>% 
+  clean_names() %>% 
+  mutate(state_ansi = str_pad(state_ansi, 2, pad = "0", side = "left"),
+         county_ansi = str_pad(county_ansi, 3, pad = "0", side = "left")) %>% 
+  unite("FIPS", c(state_ansi, county_ansi), sep = "") %>% 
+  pivot_wider(names_from = data_item,
+              values_from = value,
+              values_fn = list(value = ~ .x[1])) %>% 
+  rename(ag_retail_ops = "COMMODITY TOTALS, INCL VALUE-ADDED, RETAIL, DIRECTLY MARKETED, HUMAN CONSUMPTION - OPERATIONS WITH SALES",
+        ag_retail_usd = "COMMODITY TOTALS, INCL VALUE-ADDED, RETAIL, DIRECTLY MARKETED, HUMAN CONSUMPTION - SALES, MEASURED IN $",
+        ag_wholesale_ops =  "COMMODITY TOTALS, INCL VALUE-ADDED, WHOLESALE, DIRECT TO RETAILERS & INSTITUTIONS & FOOD HUBS, LOCAL OR REGIONALLY BRANDED PRODUCTS, HUMAN CONSUMPTION - OPERATIONS WITH SALES",
+        ag_wholesale_usd = "COMMODITY TOTALS, INCL VALUE-ADDED, WHOLESALE, DIRECT TO RETAILERS & INSTITUTIONS & FOOD HUBS, LOCAL OR REGIONALLY BRANDED PRODUCTS, HUMAN CONSUMPTION - SALES, MEASURED IN $") %>% 
+  group_by(FIPS) %>% 
+  mutate(across(ag_retail_ops:ag_wholesale_usd, ~ suppressWarnings(readr::parse_number(.x)))) %>%  
+  group_by(FIPS, state, county) %>%
+  summarise(across(ag_retail_ops:ag_wholesale_usd, ~ sum(.x, na.rm = TRUE)),
+    .groups = "drop") %>% 
+  mutate(across(
+    c(ag_retail_ops, ag_retail_usd, ag_wholesale_ops, ag_wholesale_usd),
+    ~ log(.x + 1)))
+
+non_alaska_df <- local_food %>% filter(state != "ALASKA")
+alaska_df <- local_food %>% filter(state == "ALASKA")
+
+region_lookup <- tribble(
+  ~Borough_Census_Area,                     ~USDA_Region,         ~FIPS,
+  "Anchorage Municipality",                 "ANCHORAGE",          "02020",
+  "Bristol Bay Borough",                    "ALEUTIAN ISLANDS",   "02060",
+  "Fairbanks North Star Borough",          "FAIRBANKS NORTH STAR",          "02090",
+  "Haines Borough",                         "JUNEAU",             "02100",
+  "Hoonah-Angoon Census Area",              "JUNEAU",             "02105",
+  "Juneau City and Borough",                "JUNEAU",             "02110",
+  "Kenai Peninsula Borough",                "KENAI PENINSULA",    "02122",
+  "Ketchikan Gateway Borough",              "JUNEAU",             "02130",
+  "Kodiak Island Borough",                  "ALEUTIAN ISLANDS",   "02150",
+  "Matanuska-Susitna Borough",              "ANCHORAGE",          "02170",
+  "Petersburg Borough",                     "JUNEAU",             "02195",
+  "Prince of Wales-Hyder Census Area",      "JUNEAU",             "02198",
+  "Sitka City and Borough",                 "JUNEAU",             "02220",
+  "Wrangell City and Borough",              "JUNEAU",             "02275",
+  "Yakutat City and Borough",               "JUNEAU",             "02282"
+)
+
+expanded_alaska <- region_lookup %>% 
+  left_join(alaska_df, by = c("USDA_Region" = "county")) %>% 
+  select(-FIPS.y, -USDA_Region) %>% 
+  rename(FIPS = FIPS.x,
+         county = Borough_Census_Area)
+
+corrected_local_food <- bind_rows(non_alaska_df, expanded_alaska)
+  
+
+# Restaurant Data (Source: Jeff O'Hara)
+fsa_raw <- read.csv(here("input_files","food_service_and_accomodation.csv"), header = TRUE, na.strings = c("","NA")) 
+
+fsa <- fsa_raw %>% 
+  select(-X) %>% 
+  rename(FIPS = "GeoFips",
+         fsa_usd = "X2023") %>% 
+  mutate(fsa_usd = as.numeric(fsa_usd)) %>% 
+  mutate(across(fsa_usd, ~ log(.x + 1)))
+
+# Zip-Fip data from https://github.com/clauswilke/zipcodes/blob/main/data/zip2fips.csv
+zip2fips_raw <- read.csv(here("input_files","zip2fips.csv"), header = TRUE, na.strings = c("","NA"))
+  
+# First convert the zipcode database to a join-able format
+zipfips <- zip2fips_raw %>% 
+  mutate(zipcode = str_pad(zipcode, 5, pad = "0", side = "left")) %>% 
+  mutate(zipcode = as.character(zipcode))
+
+# Then extract median household income for counties from the American Community Survey, 2022
+medincome_22 <- get_acs(geography = "county",
+                        variables = c(medincome = "B19326_001"),
+                        year = 2022, 
+                        survey = "acs5")
+
+# left join svy dat with zip 2 fips to get the relevant fips. Then left join with rucc2023 to get the relevant rucc. Then include median income for these counties. Verify matches and then clean redundant columns. 
+external_data <- svy_dat %>% select(ExternalReference, zip) %>% 
+  mutate(zip = str_pad(zip, 5, pad = "0", side = "left")) %>% 
+  mutate(zipcode = substr(zip, 1,5)) %>% 
+  left_join(zipfips, by = "zipcode") %>% 
+  left_join(fishy_data, by = "state_code", relationship = "many-to-many") %>%  
+  left_join(rucc2023, by = "FIPS") %>%
+  mutate(FIPS = str_pad(FIPS, 5, pad = "0", side = "left")) %>% 
+  left_join(medincome_22, by = c("FIPS" = "GEOID")) %>% 
+  left_join((corrected_local_food %>% select(-state, -county)) , by = "FIPS") %>% 
+  left_join((fsa %>% select(-GeoName)) , by = "FIPS") %>% 
+  select(-zip, -State, -County_Name, -NAME, -variable) %>% 
+  rename(medincome = estimate,
+         medinc_moe = moe)
+```
+
+```{r data-setup}
+#| include: true
+#| echo: true
+#| warning: false
+#| cache: true
+
+
+pre_olr_data <- ashmps_data %>% 
+  select(ExternalReference, Q6.1, Q6.3, NOAA_region, Q0.2a:Q0.2e, Q1.2_1, Q2.2_1, Q3.2_1, Q4.2_1, Q5.3_1, Q7.1, Q7.2a_1, Q6.4_Direct_a:Q6.4_Direct_c, Q6.4_Direct_g:Q6.4_Direct_i, Q7.2b_1, Q7.2e_1, Q7.2d_1, Q7.2f_1, Q6.9_Male_Full.time, Q6.9_Male_Part.time, Q6.9_Female_Full.time, Q6.9_Female_Part.time) %>%
+  # Income Brackets
+  rename(direct_income = 'Q6.1',
+       gross_income = 'Q6.3') %>% 
+  drop_na(direct_income, gross_income) %>% 
+  mutate(direct_income = factor(direct_income, ordered = TRUE,
+                       levels = c("$1 - 999", "$1,000 - 2,499", "$2,500 - 4,999",
+                                  "$5,000 - 9,999", "$10,000 - 24,999", 
+                                  "$25,000 - 49,999", "$50,000 - 99,999",
+                                  "$100,000 - 249,999", "$250,000 - 499,999",
+                                  "$500,000 - 999,999", "$1,000,000 - 2,499,999",
+                                  "$2,500,000 - 4,999,999", 
+                                  "$5,000,000 and over"))) %>% 
+  mutate(direct_income_clip = fct_collapse(direct_income, 
+                                     "$250,000 and over" = c("$250,000 - 499,999", "$500,000 - 999,999", "$1,000,000 - 2,499,999", "$2,500,000 - 4,999,999", "$5,000,000 and over"))) %>% 
+  mutate(gross_income = factor(gross_income, 
+                ordered = TRUE,
+                levels = c("$1 - 999", "$1,000 - 9,999", 
+                           "$10,000 - 49,999", "$50,000 - 99,999",
+                           "$100,000 - 499,999", "$500,000 - 999,999",
+                           "$1,000,000 - 4,999,999", "$5,000,000 and over"))) %>% 
+  mutate(income_lower = case_when(
+    direct_income_clip == "$1 - 999" ~ 1,
+    direct_income_clip == "$1,000 - 2,499" ~ 1000,
+    direct_income_clip == "$2,500 - 4,999" ~ 2500,
+    direct_income_clip == "$5,000 - 9,999" ~ 5000,
+    direct_income_clip == "$10,000 - 24,999" ~ 10000,
+    direct_income_clip == "$25,000 - 49,999" ~ 25000,
+    direct_income_clip == "$50,000 - 99,999" ~ 50000,
+    direct_income_clip == "$100,000 - 249,999" ~ 100000,
+    direct_income_clip == "$250,000 and over" ~ 250000),
+    income_upper = case_when(
+    direct_income_clip == "$1 - 999" ~ 999,
+    direct_income_clip == "$1,000 - 2,499" ~ 2499,
+    direct_income_clip == "$2,500 - 4,999" ~ 4999,
+    direct_income_clip == "$5,000 - 9,999" ~ 9999,
+    direct_income_clip == "$10,000 - 24,999" ~ 24999,
+    direct_income_clip == "$25,000 - 49,999" ~ 49999,
+    direct_income_clip == "$50,000 - 99,999" ~ 99999,
+    direct_income_clip == "$100,000 - 249,999" ~ 249999,
+    direct_income_clip == "$250,000 and over" ~ Inf)) %>% 
+  # Marketing Channels
+  rename(Consumer = 'Q0.2a',
+         Retail = 'Q0.2b',
+         Foodservice = 'Q0.2c',
+         Institution = 'Q0.2d',
+         SID = 'Q0.2e') %>% 
+  mutate(across(Consumer:SID, ~ ifelse(.x == "Yes", 1, 0))) %>% 
+  rowwise() %>% mutate(
+    num_channels = sum(c_across(c(Consumer, Retail, Foodservice, Institution, SID))),
+    channel_binary = if_else(num_channels == 1, 0, 1)
+  ) %>% ungroup() %>% 
+  mutate(strategy_type = pmap_chr(across(c(Consumer, Retail, Foodservice, Institution, SID)), ~ {
+    active_channels <- c("C", "R", "F", "I", "D")[c(...) == 1]
+    if(length(active_channels) == 0) "None" else paste(active_channels, collapse = "+")
+  })) %>% 
+    # Region
+  mutate(NOAA_region = fct_recode(NOAA_region,
+                                  Alaska = "North Pacific (Alaska)",
+                                  'West Coast' = "Pacific",
+                                  Hawaii = "Western Pacific (Hawaii)"),
+         NOAA_region = fct_relevel(NOAA_region, "Mid-Atlantic")) %>%
+  # Predictor Variables
+  rename(Live = "Q6.4_Direct_a",
+         Fresh_chilled = "Q6.4_Direct_b",
+         Frozen = "Q6.4_Direct_c",
+         Finfish = "Q6.4_Direct_g",
+         Crustaceans = "Q6.4_Direct_h",
+         Mollusks = "Q6.4_Direct_i",
+         Family_owned = "Q7.1",
+         Sex = Q7.2a_1,
+         Age = Q7.2b_1,
+         MajorOccupation = Q7.2e_1,
+         Race = Q7.2d_1) %>% 
+  mutate(across(Live:Mollusks, ~ ifelse(.x == "Yes", 1, 0))) %>% 
+  mutate(across(Family_owned, ~as.numeric(. == "Yes"))) %>%
+  mutate(across(Sex, ~as.numeric(. == "Male"))) %>% 
+      mutate(MajorOccupation = fct_recode(MajorOccupation,
+                                  "Seafood-related" = "Fishing or seafood sales",
+                                  Other = "Work other than fishing or seafood sales"),
+         MajorOccupation = fct_relevel(MajorOccupation, "Seafood-related")) %>%
+  mutate_if(is.character, as.factor) %>% 
+  mutate(Experience = 2023-Q7.2f_1) %>% 
+  # Collapsing Race
+  mutate(is_multiracial = str_detect(Race, ","),
+    OMB_Race = case_when(
+      is_multiracial ~ "Multiracial",
+      Race %in% c("White") ~ "White",
+      Race %in% c("Japanese","Vietnamese","Other Asian", "Chinese", "Filipino", "Korean") ~ "Asian",
+      Race %in% c("Native Hawaiian", "Other Pacific Islander or Chamorro or Samoan") ~ "Native Hawaiian or Other Pacific Islander",
+      Race %in% c("Black or African American") ~ "Black or African American",
+      Race %in% c("American Indian or Alaska Native") ~ "American Indian or Alaska Native",
+      TRUE ~ "NA")) %>% 
+  mutate(OMB_Race = as.factor(OMB_Race)) %>% 
+  #Number employees
+  mutate_at(c('Q6.9_Male_Full.time', 'Q6.9_Male_Part.time', 'Q6.9_Female_Full.time', 'Q6.9_Female_Part.time'), as.numeric) %>% 
+  filter(Q6.9_Male_Full.time != 13000) %>% 
+  mutate(num_employees = select(., Q6.9_Male_Full.time:Q6.9_Female_Part.time) %>% rowSums(na.rm = TRUE) %>% log1p()) %>% 
+  # Market Experience
+  mutate(earliest_dsm =pmin(Q1.2_1, Q2.2_1, Q3.2_1, Q4.2_1, Q5.3_1, na.rm = TRUE),
+         mkt_exp = 2023 - earliest_dsm) %>% 
+  # External Predictors
+  left_join(external_data, by = "ExternalReference") %>% 
+  mutate(medincome = as.numeric(medincome),
+          RUCC_2023 = factor(RUCC_2023, ordered = TRUE, #orderd Rural-to-Urbanized
+         levels = c("9","8","7","6","5","4","3","2","1"))) %>% 
+  select(!c(Q6.9_Male_Full.time:Q6.9_Female_Part.time, zipcode, county, state, state_code, FIPS, Description, medinc_moe, Q7.2f_1, Race, is_multiracial, earliest_dsm, Q1.2_1, Q2.2_1, Q3.2_1, Q4.2_1, Q5.3_1)) %>% 
+  drop_na()
+
+#Calculate counts
+strategy_count <- pre_olr_data %>% filter(NOAA_region != "Hawaii") %>% count(strategy_type, name = "Count")
+
+#create vector of strategy types to keep
+strategies_to_keep <- strategy_count %>% 
+  filter(Count >= 20) %>% 
+  pull(strategy_type)
+
+olr_data <- pre_olr_data %>%
+  mutate(strategy_type_grouped = if_else(
+    strategy_type %in% strategies_to_keep, strategy_type, "Other")
+  ) %>%
+  mutate(strategy_type_grouped = fct_relevel(strategy_type_grouped, "C"))
+```
+
+## Propensity Score Matching
+
+Propensity score score matching is a technique that develops control and treatment groups with similar characteristics that, in this context, reduce bias from non-random assignment into marketing channels. We run a logit regression where the covariates listed above are run in a regression to predect whether a fisher engages with DTC sales. The fitted values from this regression are used to calculate a 'propensity score' for each observation.
+
+We then employ nearest neighbor matching with replacement (Ho et al., 2011) to construct a control group of non-DTC businesses whose observed characteristics closely resemble those of DTC businesses. To help control for regional differences in direct seafood sales, the matches were restricted to each region businesses operated in.
+
+### Common Support
+
+```{r NNR}
+#| include: true
+#| echo: true
+#| column: screen
+#| out-width: "100%"
+#| fig-cap:
+#|  - "Figure 2: Matches chosen using nearest neighbor with replacement matching on propensity score. Operations with DTC sales = Treated, Non-Dtc sales = Control. Size of Matched Control units (unfilled circles) is proportional to the weight assigned. 15 Treatment units and 29 Control remain unmatched."
+
+nnr_1 <- matchit(Consumer ~ Sex + mkt_exp + MajorOccupation + OMB_Race + Family_owned + Live + Fresh_chilled + Frozen + Finfish + Crustaceans + Mollusks + num_employees + NOAA_region + medincome + RUCC_2023  + seafood_jobs + landing_dollars + ag_retail_usd + ag_wholesale_ops + fsa_usd,
+                 data = olr_data,
+                 method = "nearest",
+                 distance = "logit",
+                 exact = ~NOAA_region,
+                 replace = TRUE)
+
+bal.tab(nnr_1, un = TRUE, stats = c("m"), abs= TRUE, thresholds = .1)
+
+plot(nnr_1, type = "jitter", interactive = FALSE)
+
+
+new.names <- c("distance" = "Propensity Score Difference",
+                "NOAA_region_West Coast" = "Region: West Coast",
+               "NOAA_region_Alaska" = "Region: Alaska",
+               "NOAA_region_Gulf of Mexico" = "Region: Gulf of Mexico",
+               "NOAA_region_Mid-Atlantic" = "Region: Mid-Atlantic",
+               "NOAA_region_New England" = "Region: New England",
+               "NOAA_region_South Atlantic" = "Region: South Atlantic",
+               "NOAA_region_Hawaii" = "Region: Hawaii",
+               "Family_owned" = "Family Owned (Y/N)",
+               "MajorOccupation_Other" = "Other Primary Occupation",
+               "Sex" = "Sex", "mkt_exp" = "Marketing Experience (Yrs)",
+               "OMB_Race_American Indian or Alaska Native" = "Race: American Indian or Alaska Native",
+               "OMB_Race_Asian" = "Race: Asian",
+               "OMB_Race_Black or African American" = "Race: Black or African American",
+               "OMB_Race_Multiracial" = "Race: Multiracial",
+               "OMB_Race_NA" = "Race: NA",
+               "OMB_Race_Native Hawaiian or Other Pacific Islander" = "Race: Native Hawaiian or Other Pacific Islander",
+               "OMB_Race_White" = "Race: White",
+               "medincome" = "County: Median Income",
+               "num_employees" = "Number of Employees",
+               "Live" = "Seafood: Live", 
+               "Fresh_chilled" = "Seafood: Fresh or Chilled",
+               "Frozen" = "Seafood: Frozen", 
+               "Finfish" = "Seafood: Finfish",
+               "Crustaceans" = "Seafood: Crustaceans",
+               "Mollusks" = "Seafood: Mollusks",
+               "RUCC_2023_9" = "County: RUCC 9",
+               "RUCC_2023_8" = "County: RUCC 8",
+               "RUCC_2023_7" = "County: RUCC 7",
+               "RUCC_2023_6" = "County: RUCC 6",
+               "RUCC_2023_5" = "County: RUCC 5",
+               "RUCC_2023_4" = "County: RUCC 4",
+               "RUCC_2023_3" = "County: RUCC 3",
+               "RUCC_2023_2" = "County: RUCC 2",
+               "RUCC_2023_1" = "County: RUCC 1",
+               "medincome" = "County: Median Income",
+               "seafood_jobs" = "State: Number of Seafood Jobs",
+               "landing_dollars" = "State: Seafood Landings Value (USD)",
+               "ag_retail_usd" = "Direct Ag: Retail Dollar Values",
+               "ag_wholesale_ops" = "Direct Ag: Wholesale Operations",
+               "fsa_usd" = "Direct Ag: Foodservice Dollar Values")
+```
+
+```{r fig-2}
+#| include: true
+#| echo: true
+#| warning: false 
+#| column: screen
+#| out-width: "100%"
+#| fig-cap:
+#|  - "Figure 3: Common support or overlap in propensity scores of treatment and control groups. * indicates covariates for which the displayed value is the raw (unstandardized) proportional difference in means."
+
+fig_2 <- love.plot(nnr_1, abs = TRUE,
+          stats = c("m"),
+          stars = "raw", 
+          thresholds = .1,
+          var.names = new.names,
+          shapes = c("circle filled", "circle"),
+          sample.names = c("Original", "Matched"),
+          position = c(.75, .3), 
+          limits = c(0, 0.35)) +
+  theme(legend.box.background = element_rect(),
+        legend.box.margin = margin(1,1,1,1))
+
+ggsave(plot = fig_2, here("plots", "Fig2.tif"), width = 183, height = 130, units = "mm", bg = "white")
+
+matched_1 <- match_data(nnr_1) %>% 
+  mutate(NOAA_region = fct_drop(NOAA_region))
+dtc_matched_data <- get_matches(nnr_1)
+```
+
+We use frequently tested covariates that have been identified as significantly influencing agricultural direct sales. The covariates used to develop balanced control and treatment groups include demographic characteristics of direct seafood business owners, charactistics of the business, and regional and county-level indicators of the seafood industry and the direct marketing economy. The table and figures above indicate we have common support and can proceed with analysing the matched data in an interval regression.
+
+## Interval Regression Modeling
+
+We analyzed direct sales revenue outcomes using parametric interval regression (Therneau, 2024). This approach is well-suited for interval-censored data where the true dependent variable (actual direct sales revenue) is not directly observed, but instead falls within known brackets or intervals. We assume that the latent continuous income variable lies between the lower and upper bounds of income categories and follows a lognormal distribution. We implement a right-censored interval regression due to our last income bracket being \$250,000 and over.
+
+We tested three model specifications to evaluate:
+
+-   Model 1: Income regressed on DTC engagement (basic, binary model)
+
+-   Model 2: Income regressed on DTC engagement with region as a fixed effect (adjusted binary model)
+
+-   Model 3: Income regressed on Marketing Strategy (different combinations of marketing channels) with only DTC sales set as the intercept to compare against. Includes region as a fixed effect (full model)
+
+Model predictions were exponentiated to obtain predicted median income in dollar terms for each strategy type, with 95% confidence intervals calculated from the model's standard errors.
+
+# Results
+
+## Matched Sample Characteristics and Market Channel Use
+
+From a total of N=595 valid survey responses, the usable sample with complete information on covariates of interest was 323. This sample size further reduced to N = 279 in our matched dataset, with 56 non-DTC businesses (Control) and 223 businesses engaging with DTC (Treatment).
+
+```{r upset-subset}
+#| include: true
+#| echo: true
+#| warning: false 
+#| column: screen
+#| out-width: "100%"
+#| fig-cap:
+#|  - "Figure 4: Common direct marketing strategies (combinations of channels). Overall market channel engagement presented on left"
+
+fig_3 <- upset(matched_1,
+      name = 'Direct Seafood Marketing Channel Combinations',
+      intersect = c("Consumer", "Retail", "Foodservice", "Institution", "SID"),
+      base_annotations = list(
+        'Intersection size' = intersection_size()
+        + ylab('No. Direct Marketing\n Channel Combinations')
+      ),
+      set_sizes = upset_set_size(
+        filter_intersections = TRUE) 
+            + geom_text(aes(label=after_stat(count)), hjust=1.1, stat='count')
+      + expand_limits(y=255)
+      + ylab('Marketing Channel Usage')) 
+
+ggsave(plot = fig_3, here("plots", "Fig3.tif"), width = 183, height = 80, units = "mm", bg = "white")
+
+```
+
+The most common marketing strategy was DTC only, although many respondents used multiple channels in combination (Figure 4). Reported direct seafood sales income varied widely across regions, with lowest reported in the Mid-Atlantic and highest on the West Coast. Similarly, the greatest adoption of multiple marketing channels (eg. DTC + Retail + Foodservice + SID) was on the West Coast and South Atlantic (Figure 5). Insufficient matches were obtained via PSM for Hawaii, leading to it being dropped from our analysis.
+
+```{r strategy-type}
+#| include: true
+#| echo: true
+#| warning: false 
+#| column: screen
+#| out-width: "100%"
+#| fig-cap:
+#|  - "Figure 5: Number of seafood businesses in each region (matched sample, n = 279) by (A) marketing strategies and (B) reported direct sales income. Numbers in tiles indicate counts per group. Strategies combine marketing channels: C = Direct to Consumer, R = Direct to Retail, F = Direct to Foodservice, I = Direct to Institutions, SID = Source-Identified Distributor."
+
+f4_a <- matched_1 %>% 
+  count(strategy_type_grouped, NOAA_region) %>% 
+  ggplot(aes(y = NOAA_region, x = strategy_type_grouped, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n), color = "white", size = 3) +
+  coord_fixed() + scale_fill_viridis_c(option = "D") +
+  theme_minimal() +
+  labs(y = NULL,
+       x = "Marketing Strategies") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+f4_b <- matched_1 %>% 
+  count(direct_income_clip, NOAA_region) %>% 
+  ggplot(aes(y = NOAA_region, x = direct_income_clip, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n), color = "white", size = 3) +
+  coord_fixed() + scale_fill_viridis_c(option = "D") +
+  theme_minimal() +
+  labs(y = NULL, x = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+fig_4 <- f4_a + f4_b + plot_annotation(tag_levels = 'A') 
+
+fig_4
+
+ggsave(plot = fig_4, here("plots", "Fig4.tif"), width = 183, height = 75, units = "mm", bg = "white")
+
+```
+
+## Interval Regression Model Results
+
+```{r interval-reg}
+#| include: true
+#| echo: true
+#| warning: false
+#| message: false
+
+# Create Surv object (type = interval2 handles Inf for right-censored)
+matched_1$surv_income <- with(matched_1, Surv(income_lower, income_upper, type = "interval2"))
+
+mod_1 <- survreg(
+  surv_income ~ Consumer,
+  data = matched_1,
+  dist = "lognormal")
+
+mod_2 <- survreg(
+  surv_income ~ Consumer + NOAA_region,
+  data = matched_1,
+  dist = "lognormal")
+
+mod_3 <- survreg(
+  surv_income ~ strategy_type_grouped + NOAA_region,
+  data = matched_1,
+  dist = "lognormal")
+
+summary(mod_1)
+summary(mod_2)
+summary(mod_3)
+
+```
+
+```{r sum-tab}
+#| include: true
+#| echo: true
+#| warning: false
+#| tbl-cap: Interval regression model estimates predicting direct seafood sales revenue (lognormal regression, n = 279)
+#| tbl-cap-location: top
+
+t1 <- mod_1 |> tbl_regression(exponentiate = TRUE, 
+                              label = list(Consumer ~ "DTC")) |>
+  add_significance_stars(
+    pattern = "{estimate} ({conf.low}, {conf.high}){stars}",
+    hide_ci = TRUE, hide_se = TRUE
+  ) |>
+  modify_header(estimate = "**Beta (95% CI)**") |>
+  modify_abbreviation("CI = Confidence Interval") |> add_glance_table(include = c(AIC)) 
+
+t2 <- mod_2 |> tbl_regression(exponentiate = TRUE,
+                              label = list(Consumer ~ "DTC")) |>
+  add_significance_stars(
+    pattern = "{estimate} ({conf.low}, {conf.high}){stars}",
+    hide_ci = TRUE, hide_se = TRUE
+  ) |>
+  modify_header(estimate = "**Beta (95% CI)**") |>
+  modify_abbreviation("CI = Confidence Interval") |> add_glance_table(include = c(AIC)) 
+
+t3 <- mod_3 |> tbl_regression(exponentiate = TRUE) |>
+  add_significance_stars(
+    pattern = "{estimate} ({conf.low}, {conf.high}){stars}",
+    hide_ci = TRUE, hide_se = TRUE
+  ) |>
+  modify_header(estimate = "**Beta (95% CI)**") |>
+  modify_abbreviation("CI = Confidence Interval") |> add_glance_table(include = c(AIC)) 
+
+t_merge <- tbl_merge(
+  tbls = list(t1,t2,t3),
+  tab_spanner = c("**Model 1:\nDTC vs non-DTC**", "**Model 2:\nRegional Effects**", "**Model 3:\nMarketing Strategies**")) |>
+  as_gt()
+
+t_merge
+
+```
+
+### Model Predictions
+
+The exponents and CIs presented above are in the log-scale and thus need to be back transformed to represent \$ values. We provide below the predicted median incomes (with 95% CI) for each marketing strategy in our matched sample (n=292).
+
+```{r mod-pred}
+#| include: true
+#| echo: true
+#| warning: false 
+#| column: screen
+#| out-width: "100%"
+#| fig-cap: 
+#| - "Predicted median income (USD) and 95% CI from Model 3, by marketing strategy and region. Region labels indicate number of direct seafood businesses, strategy labels show overall frequency. Strategies combine marketing channels: C = Direct to Consumer, R = Direct to Retail, F = Direct to Foodservice, I = Direct to Institutions, SID = Source-Identified Distributor."
+#| tbl-cap: Predicted median income (USD) and 95% CI from Model 3, by marketing strategy for our matched sample (n = 279)
+
+valid_regions <- levels(matched_1$NOAA_region)
+
+newdata <- expand.grid(
+  strategy_type_grouped = levels(as.factor(matched_1$strategy_type_grouped)),
+  NOAA_region = valid_regions)
+
+pred <- predict(mod_3, newdata = newdata, se.fit = TRUE, type = "link")
+log_scale <- mod_3$scale
+
+# Convert from log-scale to income scale (median of lognormal)
+newdata <- newdata %>% 
+  mutate(pred_link = pred$fit,
+         se_link = pred$se.fit,
+         pred_median = exp(pred_link),
+         ci_lower = exp(pred_link - 1.96 * se_link),
+         ci_upper = exp(pred_link + 1.96 * se_link)
+  )
+
+pred_df <- newdata %>% 
+  mutate(strategy_label = recode(strategy_type_grouped,
+  "C" = "Consumer Only (46)",
+  "C+D" = "Consumer & SID (28)",
+  "C+R" = "Consumer & Retail (27)",
+  "C+R+D" = "Consumer & Retail & SID (25)",
+  "C+R+F" = "Consumer & Retail & \nFoodservice (28)",
+  "C+R+F+D" = "Consumer & Retail & \nFoodservice & SID (37)",
+  "D" = "SID Only (26)",
+  "Other" = "Other Combinations (62)"),
+  strategy_label_short = recode(strategy_type_grouped,
+  "C" = "C only (46)",
+  "C+D" = "C & SID (28)",
+  "C+R" = "C & R (27)",
+  "C+R+D" = "C & R & SID (25)",
+  "C+R+F" = "C & R & F (28)",
+  "C+R+F+D" = "C & R & F & SID (37)",
+  "D" = "SID Only (26)",
+  "Other" = "Other Combos (62)"),
+  region_label = recode(NOAA_region,
+                        "Alaska" = "Alaska (37)",
+                        "West Coast" = "West Coast (64)",
+                        "Gulf of Mexico" = "Gulf of Mexico (26)",
+                        "Mid-Atlantic" = "Mid-Atlantic (40)",
+                        "New England" = "New England (60)",
+                        "South Atlantic" = "South Atlantic (52)"))
+
+overall_df <- pred_df %>%
+  group_by(strategy_type_grouped, strategy_label, strategy_label_short) %>%
+  summarise(
+    pred_median = mean(pred_median, na.rm = TRUE),
+    ci_lower = mean(ci_lower, na.rm = TRUE),
+    ci_upper = mean(ci_upper, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(region_label = "All Regions (n = 279)")
+
+pred_tab <- overall_df %>% select(-strategy_type_grouped, -strategy_label, -region_label) 
+pred_tab
+
+pred_df_combined <- bind_rows(pred_df, overall_df) %>% 
+  mutate(region_label = fct_relevel(region_label, "All Regions (n = 279)"))
+
+fig_5 <- ggplot(pred_df_combined, aes(x = reorder(strategy_label_short, pred_median), y = pred_median)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  scale_y_continuous(labels = dollar_format()) +
+  facet_wrap(.~region_label, ncol = 2) +
+  labs(x = "Marketing Strategy",
+    y = "Predicted Median Income (USD)"
+  ) +
+  theme_minimal(base_size = 12) +
+  coord_flip() +
+  theme(panel.spacing = unit(0.5, "lines"),
+        strip.text = element_text(size = 11))
+
+ggsave(plot = fig_5, here("plots", "Fig5.tif"), width = 183, height = 160, units = "mm", bg = "white")
+
+```
